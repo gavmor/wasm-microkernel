@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/eliben/watgo"
-	"github.com/eliben/watgo/wasmir"
 	"github.com/gavmor/wasm-microkernel/abi"
 	"github.com/gavmor/wasm-microkernel/host"
 	"github.com/tetratelabs/wazero"
@@ -15,8 +13,10 @@ import (
 )
 
 type Harness struct {
-	Runtime wazero.Runtime
-	Module  api.Module
+	Runtime    wazero.Runtime
+	Module     api.Module
+	t          *testing.T
+	mockedFuncs map[string]map[string]bool
 }
 
 // New creates an isolated Wasm environment for unit testing.
@@ -28,12 +28,20 @@ func New(t *testing.T) *Harness {
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
 	return &Harness{
-		Runtime: r,
+		Runtime:     r,
+		t:           t,
+		mockedFuncs: make(map[string]map[string]bool),
 	}
 }
 
 // Load compiles and instantiates the given .wasm bytes.
+// Before compilation it validates that every non-WASI import has a
+// corresponding mock registered via MockHostFunction.
 func (h *Harness) Load(ctx context.Context, wasmBytes []byte) error {
+	if err := abi.ValidateABI(wasmBytes, nil, h.mockedFuncs); err != nil {
+		return err
+	}
+
 	compiled, err := h.Runtime.CompileModule(ctx, wasmBytes)
 	if err != nil {
 		return fmt.Errorf("failed to compile plugin: %w", err)
@@ -57,11 +65,24 @@ func (h *Harness) NewHostModule(name string) *host.ModuleBuilder {
 }
 
 // MockHostFunction is a convenience method for registering a single-function host module.
+// It also records the function in the mockedFuncs map so that Load-time import
+// validation knows which host capabilities are available.
 func (h *Harness) MockHostFunction(module, name string, params, results []api.ValueType, fn api.GoModuleFunction) {
+	if h.mockedFuncs[module] == nil {
+		h.mockedFuncs[module] = make(map[string]bool)
+	}
+	h.mockedFuncs[module][name] = true
+
 	err := host.RegisterCapability(h.Runtime, module, name, params, results, fn)
 	if err != nil {
 		panic(err)
 	}
+}
+
+// MockedFuncs returns the map of mocked host functions keyed by module name,
+// suitable for passing to abi.ValidateABI for standalone validation calls.
+func (h *Harness) MockedFuncs() map[string]map[string]bool {
+	return h.mockedFuncs
 }
 
 // CallExport invokes a generic export and handles fat-pointer unpacking.
@@ -109,53 +130,4 @@ func (h *Harness) Close() error {
 		return h.Runtime.Close(context.Background())
 	}
 	return nil
-}
-
-// ABIReport contains results of the ABI validation.
-type ABIReport struct {
-	Errors   []ABIError
-	Warnings []string
-}
-
-type ABIError struct {
-	Name    string
-	Message string
-}
-
-func (r ABIReport) Valid() bool { return len(r.Errors) == 0 }
-
-func (r ABIReport) Error() string {
-	var res string
-	for _, e := range r.Errors {
-		res += fmt.Sprintf("ERROR [%s]: %s\n", e.Name, e.Message)
-	}
-	for _, w := range r.Warnings {
-		res += fmt.Sprintf("WARNING: %s\n", w)
-	}
-	return res
-}
-
-// ValidateABI checks if the given .wasm bytes adhere to the expected contract.
-func ValidateABI(wasmBytes []byte, requiredExports map[string][]api.ValueType) ABIReport {
-	report := ABIReport{}
-	mod, err := watgo.DecodeWASM(wasmBytes)
-	if err != nil {
-		report.Errors = append(report.Errors, ABIError{"Decode", err.Error()})
-		return report
-	}
-
-	for name, _ := range requiredExports {
-		found := false
-		for _, exp := range mod.Exports {
-			if exp.Name == name && exp.Kind == wasmir.ExternalKindFunction {
-				found = true
-				break
-			}
-		}
-		if !found {
-			report.Errors = append(report.Errors, ABIError{"Export", fmt.Sprintf("missing required export: %s", name)})
-		}
-	}
-
-	return report
 }
