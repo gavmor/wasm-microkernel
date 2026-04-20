@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/gavmor/wasm-microkernel/abi"
 	"github.com/gavmor/wasm-microkernel/capabilities"
@@ -38,6 +39,7 @@ type Kernel struct {
 }
 
 type plugin struct {
+	mu     sync.Mutex
 	module api.Module
 }
 
@@ -91,6 +93,10 @@ func (k *Kernel) Call(name string, input any) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("plugin %q not loaded", name)
 	}
+
+	// WASM Go runtime is single-threaded; serialize concurrent callers per plugin.
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	payload, err := json.Marshal(input)
 	if err != nil {
