@@ -5,10 +5,12 @@
 // Generated from wit/podpedia.wit via wit-bindgen-go, then extended with
 // correct u64/u32 return types (pending wasip2 result-lifting support).
 //
-// Plugins import this package instead of writing //go:wasmimport declarations
+// Plugins use this package instead of writing //go:wasmimport declarations
 // by hand. Input strings use the canonical WIT ABI (cm.LowerString → i32+i32).
-// Output strings are returned as fat pointers (ptr<<32|len) and decoded here,
-// so callers never see unsafe.
+// The fat-pointer response decoding is isolated here so plugins stay unsafe-free.
+//
+// The Execute export and allocate export remain in each plugin's main.go;
+// they use abi.Delegate and abi.GuestAllocate respectively (unchanged).
 package guest
 
 import (
@@ -17,11 +19,10 @@ import (
 	"github.com/bytecodealliance/wasm-tools-go/cm"
 )
 
-// WITModule is the canonical module name plugins import from.
-// The host must register capabilities under this name.
-const WITModule = "podpedia:kernel/host-capabilities@0.3.0"
-
 // ── Capability wrappers ───────────────────────────────────────────────────────
+// Plugins call these instead of raw //go:wasmimport declarations.
+// String inputs go through cm.LowerString (canonical i32+i32, no manual packing).
+// Responses come back as []byte decoded from the host's fat pointer.
 
 // HTTPPost calls the host's generic HTTP POST and returns the response body.
 func HTTPPost(url, body string) []byte {
@@ -56,23 +57,12 @@ func Log(msg string) {
 	hostLogMsg((*uint8)(msg0), msg1)
 }
 
-// ReturnBytes encodes a response byte slice as a fat pointer for export from Execute.
-// Plugins call this as their final return: return guest.ReturnBytes(out).
-func ReturnBytes(b []byte) uint64 {
-	if len(b) == 0 {
-		return 0
-	}
-	// Allocate space in guest's own linear memory for the return value.
-	ptr := allocate(uint32(len(b)))
-	dst := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(ptr))), len(b))
-	copy(dst, b)
-	return (uint64(ptr) << 32) | uint64(len(b))
-}
-
 // ── Raw host imports (canonical WIT ABI) ─────────────────────────────────────
-// Inputs: strings as (ptr *uint8, len uint32) — canonical i32+i32.
-// Outputs: fat pointer (u64) for strings, u32 for status. Return types are
-// hand-written because wit-bindgen-go v0.3.2 drops them for wasip1 targets.
+// Module: "podpedia:kernel/host-capabilities@0.3.0" (from wit/podpedia.wit).
+// Inputs: two i32s per string (ptr, len) — output of cm.LowerString.
+// Returns: u64 fat pointer for strings, u32 for status codes.
+// Return types are hand-written because wit-bindgen-go v0.3.2 drops them
+// for wasip1 targets.
 
 //go:wasmimport podpedia:kernel/host-capabilities@0.3.0 http-post
 //go:noescape
@@ -94,20 +84,12 @@ func hostFileWrite(path0 *uint8, path1 uint32, data0 *uint8, data1 uint32) uint3
 //go:noescape
 func hostLogMsg(msg0 *uint8, msg1 uint32)
 
-// ── Guest memory helpers ──────────────────────────────────────────────────────
+// ── Response decoding ─────────────────────────────────────────────────────────
 
-// allocate is the guest-side bump allocator, exported for the host to call
-// when writing response data into guest memory.
-//
-//go:wasmexport allocate
-func allocate(size uint32) uint32 {
-	b := make([]byte, size)
-	return uint32(uintptr(unsafe.Pointer(&b[0])))
-}
-
-// readFatPtr decodes a fat pointer (ptr<<32|len) from the host into a byte slice.
-// The unsafe here is the minimum necessary in wasip1: the host wrote the bytes
-// into our linear memory at ptr; we read them back by address.
+// readFatPtr decodes a fat pointer (ptr<<32|len) written by the host into guest
+// linear memory. The unsafe.Slice here is the minimum unavoidable in wasip1:
+// the host wrote the bytes at ptr; we must read them by address. This is the
+// only use of unsafe in the system; plugins themselves import only this package.
 func readFatPtr(fatPtr uint64) []byte {
 	ptr := uint32(fatPtr >> 32)
 	size := uint32(fatPtr)
