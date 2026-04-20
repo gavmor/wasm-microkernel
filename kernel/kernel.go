@@ -44,9 +44,6 @@ type plugin struct {
 // New boots the wazero runtime, instantiates WASI, and registers all
 // standard host capabilities. The host application calls this once at startup.
 func New(ctx context.Context, cfg Config) (*Kernel, error) {
-	if cfg.ModuleName == "" {
-		cfg.ModuleName = "wasm_host"
-	}
 	if cfg.LogWriter == nil {
 		cfg.LogWriter = os.Stderr
 	}
