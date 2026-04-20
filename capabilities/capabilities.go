@@ -1,7 +1,14 @@
 // Package capabilities provides standard host function implementations
-// (HTTP, file I/O, logging) that any wasm-microkernel host can register.
-// These are the "syscalls" that plugins consume — analogous to OS userland
-// interfaces — so the host application never touches Wasm memory directly.
+// (HTTP, file I/O, logging) registered under the canonical WIT module name.
+//
+// The ABI matches wit/podpedia.wit:
+//   - Input strings: canonical i32+i32 (ptr, len) — matches cm.LowerString output
+//   - Output strings: fat pointer u64 (ptr<<32|len) written into guest memory
+//   - Status returns: u32 (1=ok, 0=err)
+//
+// The host reads strings via wazero's safe mod.Memory().Read(), so no unsafe
+// is required on the host side. The only unsafe in the system is in guest/guest.go
+// where the plugin reads back host-allocated fat pointers.
 package capabilities
 
 import (
@@ -19,41 +26,46 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
+// WITModule is the canonical capability module name from wit/podpedia.wit.
+// Plugins import functions from this module via //go:wasmimport.
+const WITModule = "podpedia:kernel/host-capabilities@0.3.0"
+
 // Config controls which capabilities are registered and how they behave.
 type Config struct {
-	// ModuleName is the Wasm import module name (e.g. "podpedia_host").
-	// Plugins import functions from this name via //go:wasmimport.
+	// ModuleName overrides WITModule if set. Use only for legacy plugin compat.
 	ModuleName string
 
-	// LogWriter receives log messages from the log capability.
+	// LogWriter receives log messages from the log-msg capability.
 	// Defaults to os.Stderr.
 	LogWriter io.Writer
 }
 
-// Register instantiates the standard capability module in r.
-// Plugins can then import: http_post, fetch_url, http_download, file_write, log.
-func Register(ctx context.Context, r wazero.Runtime, cfg Config) error {
-	if cfg.ModuleName == "" {
-		cfg.ModuleName = "wasm_host"
+func (c Config) moduleName() string {
+	if c.ModuleName != "" {
+		return c.ModuleName
 	}
+	return WITModule
+}
+
+// Register instantiates the standard capability module in r under the WIT
+// module name. Plugins compiled against guest/guest.go will import from here.
+func Register(ctx context.Context, r wazero.Runtime, cfg Config) error {
 	if cfg.LogWriter == nil {
 		cfg.LogWriter = os.Stderr
 	}
 
-	one64 := []api.ValueType{api.ValueTypeI64}
-	one32 := []api.ValueType{api.ValueTypeI32}
-	b := host.NewModuleBuilder(r, cfg.ModuleName)
+	two32one64 := []api.ValueType{api.ValueTypeI32, api.ValueTypeI32}           // (ptr, len) string in
+	four32one64 := []api.ValueType{api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32} // two strings in
+	retU64 := []api.ValueType{api.ValueTypeI64}
+	retU32 := []api.ValueType{api.ValueTypeI32}
 
-	// fetch_url(fat_ptr url) -> fat_ptr body  — generic HTTP GET
-	b.ExportFunction("fetch_url", one64, one64,
+	b := host.NewModuleBuilder(r, cfg.moduleName())
+
+	// http-fetch(url-ptr, url-len) -> u64 fat-ptr  — generic HTTP GET
+	b.ExportFunction("http-fetch", two32one64, retU64,
 		api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-			off, ln := abi.DecodeFatPointer(stack[0])
-			urlBytes, err := abi.ReadGuestBuffer(ctx, mod, off, ln)
-			if err != nil {
-				stack[0] = writeToGuest(ctx, mod, errJSON(err))
-				return
-			}
-			body, err := httpGet(string(urlBytes))
+			url := readString(mod, uint32(stack[0]), uint32(stack[1]))
+			body, err := httpGet(url)
 			if err != nil {
 				stack[0] = writeToGuest(ctx, mod, errJSON(err))
 				return
@@ -62,54 +74,32 @@ func Register(ctx context.Context, r wazero.Runtime, cfg Config) error {
 		}),
 	)
 
-	// http_post(fat_ptr {url,body,content_type?}) -> fat_ptr response-bytes
-	// Generic HTTP POST — plugins use this to call Ollama, Deepgram, etc.
-	b.ExportFunction("http_post", one64, one64,
+	// http-post(url-ptr, url-len, body-ptr, body-len) -> u64 fat-ptr
+	b.ExportFunction("http-post", four32one64, retU64,
 		api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-			off, ln := abi.DecodeFatPointer(stack[0])
-			raw, _ := abi.ReadGuestBuffer(ctx, mod, off, ln)
-			var req struct {
-				URL         string `json:"url"`
-				Body        string `json:"body"`
-				ContentType string `json:"content_type"`
-			}
-			if err := json.Unmarshal(raw, &req); err != nil {
-				stack[0] = writeToGuest(ctx, mod, errJSON(err))
-				return
-			}
-			ct := req.ContentType
-			if ct == "" {
-				ct = "application/json"
-			}
-			resp, err := http.Post(req.URL, ct, strings.NewReader(req.Body)) //nolint:gosec
+			url := readString(mod, uint32(stack[0]), uint32(stack[1]))
+			body := readString(mod, uint32(stack[2]), uint32(stack[3]))
+			resp, err := http.Post(url, "application/json", strings.NewReader(body)) //nolint:gosec
 			if err != nil {
 				stack[0] = writeToGuest(ctx, mod, errJSON(err))
 				return
 			}
 			defer func() { _ = resp.Body.Close() }()
-			body, err := io.ReadAll(resp.Body)
+			respBody, err := io.ReadAll(resp.Body)
 			if err != nil {
 				stack[0] = writeToGuest(ctx, mod, errJSON(err))
 				return
 			}
-			stack[0] = writeToGuest(ctx, mod, body)
+			stack[0] = writeToGuest(ctx, mod, respBody)
 		}),
 	)
 
-	// http_download(fat_ptr {url,dest}) -> i32 1=ok 0=err
-	b.ExportFunction("http_download", one64, one32,
+	// http-download(url-ptr, url-len, dest-ptr, dest-len) -> u32 1=ok 0=err
+	b.ExportFunction("http-download", four32one64, retU32,
 		api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-			off, ln := abi.DecodeFatPointer(stack[0])
-			raw, _ := abi.ReadGuestBuffer(ctx, mod, off, ln)
-			var req struct {
-				URL  string `json:"url"`
-				Dest string `json:"dest"`
-			}
-			if err := json.Unmarshal(raw, &req); err != nil {
-				stack[0] = 0
-				return
-			}
-			if err := downloadFile(req.URL, req.Dest); err != nil {
+			url := readString(mod, uint32(stack[0]), uint32(stack[1]))
+			dest := readString(mod, uint32(stack[2]), uint32(stack[3]))
+			if err := downloadFile(url, dest); err != nil {
 				stack[0] = 0
 				return
 			}
@@ -117,25 +107,16 @@ func Register(ctx context.Context, r wazero.Runtime, cfg Config) error {
 		}),
 	)
 
-	// file_write(fat_ptr {path,data}) -> i32 1=ok 0=err
-	// Lets plugins persist output without needing WASI dir mounts.
-	b.ExportFunction("file_write", one64, one32,
+	// file-write(path-ptr, path-len, data-ptr, data-len) -> u32 1=ok 0=err
+	b.ExportFunction("file-write", four32one64, retU32,
 		api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-			off, ln := abi.DecodeFatPointer(stack[0])
-			raw, _ := abi.ReadGuestBuffer(ctx, mod, off, ln)
-			var req struct {
-				Path string `json:"path"`
-				Data string `json:"data"`
-			}
-			if err := json.Unmarshal(raw, &req); err != nil {
+			path := readString(mod, uint32(stack[0]), uint32(stack[1]))
+			data := readString(mod, uint32(stack[2]), uint32(stack[3]))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				stack[0] = 0
 				return
 			}
-			if err := os.MkdirAll(filepath.Dir(req.Path), 0o755); err != nil {
-				stack[0] = 0
-				return
-			}
-			if err := os.WriteFile(req.Path, []byte(req.Data), 0o644); err != nil {
+			if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 				stack[0] = 0
 				return
 			}
@@ -143,12 +124,11 @@ func Register(ctx context.Context, r wazero.Runtime, cfg Config) error {
 		}),
 	)
 
-	// log(fat_ptr message) — fire and forget, writes to LogWriter
-	b.ExportFunction("log", one64, nil,
+	// log-msg(msg-ptr, msg-len) — fire and forget
+	b.ExportFunction("log-msg", two32one64, nil,
 		api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-			off, ln := abi.DecodeFatPointer(stack[0])
-			msg, _ := abi.ReadGuestBuffer(ctx, mod, off, ln)
-			_, _ = cfg.LogWriter.Write(append(msg, '\n'))
+			msg := readString(mod, uint32(stack[0]), uint32(stack[1]))
+			_, _ = cfg.LogWriter.Write([]byte(msg + "\n"))
 		}),
 	)
 
@@ -157,8 +137,16 @@ func Register(ctx context.Context, r wazero.Runtime, cfg Config) error {
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
-// writeToGuest allocates memory in the guest module and writes data into it,
-// returning a fat pointer. Used by host capability implementations.
+// readString reads a (ptr, len) string from guest linear memory via wazero's
+// safe Memory().Read(). No unsafe required on the host side.
+func readString(mod api.Module, ptr, length uint32) string {
+	b, _ := mod.Memory().Read(ptr, length)
+	return string(b)
+}
+
+// writeToGuest allocates memory in the guest (via its "allocate" export) and
+// writes data into it, returning a fat pointer. This is how the host returns
+// heap-allocated strings to plugins in wasip1.
 func writeToGuest(ctx context.Context, mod api.Module, data []byte) uint64 {
 	alloc := mod.ExportedFunction("allocate")
 	if alloc == nil {

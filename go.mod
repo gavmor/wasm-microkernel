@@ -7,4 +7,7 @@ require (
 	github.com/tetratelabs/wazero v1.11.0
 )
 
-require golang.org/x/sys v0.38.0 // indirect
+require (
+	github.com/bytecodealliance/wasm-tools-go v0.3.2 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+)

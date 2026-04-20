@@ -19,8 +19,9 @@ import (
 
 // Config is the only thing the host application needs to provide.
 type Config struct {
-	// ModuleName is the Wasm import module name plugins use (e.g. "podpedia_host").
-	// Defaults to "wasm_host".
+	// ModuleName overrides the canonical WIT module name for capability registration.
+	// Defaults to capabilities.WITModule ("podpedia:kernel/host-capabilities@0.3.0").
+	// Set this only for legacy plugin compatibility.
 	ModuleName string
 
 	// LogWriter receives plugin log messages. Defaults to os.Stderr.

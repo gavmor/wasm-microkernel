@@ -1,0 +1,31 @@
+package podpedia:kernel@0.3.0;
+
+/// Capabilities the microkernel provides to every plugin.
+/// Return values use fat pointers (u64 = ptr<<32|len) into guest linear memory
+/// for heap strings, and u32 for status codes. This keeps the ABI compatible
+/// with wasip1 until wasip2 result-lifting is widely supported.
+interface host-capabilities {
+    /// Generic HTTP POST. Returns a fat pointer to the response body.
+    http-post: func(url: string, body: string) -> u64;
+
+    /// Generic HTTP GET. Returns a fat pointer to the response body.
+    http-fetch: func(url: string) -> u64;
+
+    /// Download url to dest on the host filesystem. Returns 1=ok, 0=err.
+    http-download: func(url: string, dest: string) -> u32;
+
+    /// Write data to path on the host filesystem. Returns 1=ok, 0=err.
+    file-write: func(path: string, data: string) -> u32;
+
+    /// Fire-and-forget log message.
+    log-msg: func(msg: string);
+}
+
+/// Every Podpedia plugin satisfies this world: one JSON-in/JSON-out
+/// execute function. Business types stay in JSON; WIT owns the boundary.
+world plugin-world {
+    import host-capabilities;
+
+    /// Receive a JSON request, return a fat pointer to a JSON response.
+    export execute: func(req-json: string) -> u64;
+}
