@@ -2,16 +2,78 @@
 
 A small Go SDK for embedding WebAssembly plugins in a host application,
 built directly on [`wazero`](https://github.com/tetratelabs/wazero) and
-`GOOS=wasip1 GOARCH=wasm`. The SDK hides every fat-pointer / linear-memory
-detail behind two short packages so plugin authors and host applications
-never touch raw Wasm ABI.
+`GOOS=wasip1 GOARCH=wasm`.
+
+The SDK has one purpose: **give plugin authors the developer experience
+of the Component Model — Go strings in, Go strings out, capabilities
+that feel like standard library calls — using only the parts of the Go
+WebAssembly toolchain that actually work today.**
+
+## What This Is (and What It Isn't)
+
+This project is, candidly, an independent re-derivation of
+[**waPC**](https://wapc.io/) / a lightweight in-house variant of
+[**Extism**](https://extism.org/). That is on purpose, not by accident.
+
+We started by chasing the Component Model — WIT files,
+`wit-bindgen-go`, `Result<T, E>` lifting, the works — and ran straight
+into the current state of the Go Wasm ecosystem:
+
+- Want the Component Model **today**? You're using Rust + `wasmtime`.
+- Want a **pure-Go** host runtime (`wazero`)? You're stuck on `wasip1`,
+  which means fat pointers and manual linear-memory management.
+
+We chose pure Go + `wazero`, so the Component Model dream had to be
+deferred. What we kept is the *experience* the Component Model
+promises, even though the plumbing underneath is `wasip1`.
+
+### Why not just use Extism or waPC directly?
+
+Off-the-shelf plugin frameworks dictate large parts of your application
+architecture — their SDK, their logging model, their capability surface,
+their distribution story. For a long-lived host that we want to evolve
+on our own terms, tightly coupling the core to a heavy third-party
+plugin framework is a liability. The microkernel here is small enough
+to read in an afternoon and bend in any direction we need.
+
+### The actual differentiator: plugin DevEx insulation
+
+Plugin authors never see a fat pointer. They write code like this:
+
+```go
+guest.Register(func(req string) (string, error) {
+    guest.LogMsg("running...")
+    body, err := guest.HttpPost("http://ollama.local/api/generate", req)
+    if err != nil {
+        return "", err
+    }
+    return body, nil
+})
+```
+
+That is the entire plugin contract. Standard `string`, standard `error`,
+capabilities that look and feel like the standard library. The
+microkernel is the only thing that knows the ABI is ugly underneath.
+
+### Forward path
+
+This positioning matters for the migration ahead. When `wazero` ships
+real Component Model support and `wit-bindgen-go` grows a usable host
+shim, **plugin code does not have to change**. We swap the internal
+implementation of `guest/` and `host/`, delete `abi/`, and let WIT
+handle the memory. The plugin's `Register` / `LogMsg` / `HttpPost`
+surface stays exactly as-is.
+
+The fat-pointer protocol described below is a temporary bridge over a
+missing feature in the Go compiler. It's ugly underneath; the traffic
+driving over it is safe.
 
 > **Why v0.6.0?** Earlier drafts of this repo experimented with WIT
 > definitions and `wit-bindgen-go`. In practice, `wit-bindgen-go` only
 > emits guest-side bindings and produces no host shim for `wazero`, so
-> the WIT layer added ceremony without simplifying anything. v0.6.0 drops
-> WIT entirely in favor of a tiny, hand-written fat-pointer protocol that
-> `wazero` + `wasip1` actually support today.
+> the WIT layer added ceremony without simplifying anything. v0.6.0
+> drops WIT entirely in favor of the small fat-pointer protocol the
+> rest of this README describes.
 
 ## Repository Layout
 
