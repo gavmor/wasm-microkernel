@@ -1,132 +1,195 @@
-# `wasm-microkernel` Plugin Development Guide
+# `wasm-microkernel` v0.6.0
 
-Welcome to the `wasm-microkernel` ecosystem! This generic Go SDK utilizes a WebAssembly (Wasm) microkernel architecture to securely load and execute third-party extensions for any host application.
+A small Go SDK for embedding WebAssembly plugins in a host application,
+built directly on [`wazero`](https://github.com/tetratelabs/wazero) and
+`GOOS=wasip1 GOARCH=wasm`. The SDK hides every fat-pointer / linear-memory
+detail behind two short packages so plugin authors and host applications
+never touch raw Wasm ABI.
 
-Because `wasm-microkernel` executes plugins within a strictly isolated Wasm sandbox, your code cannot crash the host process or access unauthorized system resources. To provide maximum flexibility and the best developer experience, this framework enforces a **Tri-Module Architecture**:
+> **Why v0.6.0?** Earlier drafts of this repo experimented with WIT
+> definitions and `wit-bindgen-go`. In practice, `wit-bindgen-go` only
+> emits guest-side bindings and produces no host shim for `wazero`, so
+> the WIT layer added ceremony without simplifying anything. v0.6.0 drops
+> WIT entirely in favor of a tiny, hand-written fat-pointer protocol that
+> `wazero` + `wasip1` actually support today.
 
-1. **Host Application:** The core application embedding the microkernel (you don't need to import this).
-    
-2. **Domain Contract:** The shared contract containing data structures (DTOs) and interface definitions defined by the host application. This decoupled approach is heavily inspired by the architectural patterns of the Model Context Protocol (MCP).
-    
-3. **`wasm-microkernel`:** This lightweight SDK providing memory translation, host function builders, and a local testing harness.
-    
+## Repository Layout
+
+```text
+wasm-microkernel/
+├── abi/
+│   └── ptr.go         # Shared (ptr<<32 | len) fat-pointer encoding
+├── guest/
+│   ├── guest.go       # Plugin-side: exports `allocate` and `execute`
+│   └── host_funcs.go  # Plugin-side: clean wrappers around //go:wasmimport
+└── host/
+    ├── engine.go      # Host-side: wazero wrapper and lifecycle
+    └── host_funcs.go  # Host-side: real implementations of capabilities
+```
+
+Only `github.com/tetratelabs/wazero` is a direct dependency.
+
+## Architecture in One Picture
+
+```
+┌──────────────────────┐                ┌────────────────────────┐
+│  Your host app       │                │  Your plugin (.wasm)   │
+│  (e.g. podpedia)     │                │  GOOS=wasip1           │
+│                      │                │                        │
+│  engine.Execute(…)   │ ── execute ──▶ │  guest.execute         │
+│                      │                │   └ pluginHandler(req) │
+│  hostHttpPost ◀───── │ ── http_post ──┤  guest.HttpPost(url,…) │
+│  hostLogMsg   ◀───── │ ── log_msg  ───┤  guest.LogMsg("…")     │
+└──────────────────────┘                └────────────────────────┘
+        host/                                     guest/
+```
+
+All cross-boundary values are encoded as a single 64-bit fat pointer
+(`ptr<<32 | len`) using `abi.Encode` / `abi.Decode`. Responses use a
+1-byte framing flag: `0` for success, `1` for an error string.
 
 ## Prerequisites
 
-- **Go 1.26:** Go 1.26 is strictly recommended. For WebAssembly applications, the Go 1.26 runtime manages chunks of heap memory in much smaller increments, which leads to significantly reduced memory usage for lightweight applications with heaps under 16 MiB.
-    
+- Go 1.26 or newer (the module declares `go 1.26.1`).
+- Plugins must be built for `wasip1` in reactor mode (see Step 4).
 
-## Step 1: Project Setup
+## Step 1: Write a Plugin
 
-Initialize your Go module and fetch the required dependencies. You **do not** need to clone or import the core host application's repository, only its shared protocol and this SDK.
-```bash
-go mod init github.com/your-org/my-custom-plugin
-go get github.com/your-org/host-protocol
-go get github.com/your-org/wasm-microkernel
-```
-
-## Step 2: Implementing the Contract (WASI Reactor)
-
-Plugins built with this SDK are compiled as **WASI Reactors**. Unlike standard command modules that run a `main()` function and exit, a reactor initializes its state once and remains continuously alive in memory, allowing its exported functions to be called multiple times.
-
-To expose your function to the Wasm host, use the `//go:wasmexport` compiler directive. Because Wasm operates in a 32-bit address space, you must use the `wasm-microkernel` SDK's ABI helpers to pass complex types (like JSON or structs) across the boundary using "fat pointers" (a 64-bit integer combining the memory address and the length).
+A plugin is an ordinary Go program with one entry point. Register your
+handler from `init()` — **not** `main()`, because reactor builds never
+invoke `main`.
 
 ```go
 package main
 
 import (
-	"encoding/json"
-	"unsafe"
-	
-	"github.com/your-org/host-protocol"
-	"github.com/your-org/wasm-microkernel/abi"
+    "github.com/gavmor/wasm-microkernel/guest"
 )
 
-// main is required by the compiler but skipped in reactor mode.
-func main() {}
+func init() {
+    guest.Register(func(reqJSON string) (string, error) {
+        guest.LogMsg("running extractor for: " + reqJSON)
 
-//go:wasmexport Execute
-func Execute(payloadOffset, payloadLength uint32) uint32 {
-    // 1. Read the payload from the host using the SDK
-    rawBytes := abi.ReadHostBuffer(payloadOffset, payloadLength)
-    
-    // 2. Parse the host's protocol DTO
-    var call protocol.HostRequest
-    json.Unmarshal(rawBytes, &call)
-    
-    //... Perform your custom business logic...
-    
-    return 0 // 0 indicates success to the microkernel
-}
-```
-
-## Step 3: Using Host Capabilities
-
-If your plugin needs to interact with the host (e.g., to emit telemetry or save a file), you must import a host capability. The host safely exposes these capabilities via Wasm imports.
-
-```go
-// Import the event publisher from the host application
-//go:wasmimport host_env publish_event
-func publish_event_host(offset uint32, length uint32)
-
-// EmitEvent is a helper utilizing the SDK to safely pass data back to the host
-func EmitEvent(event protocol.EventDTO) {
-	bytes, _ := json.Marshal(event)
-	
-	// The SDK handles packing the pointer and length for the Wasm ABI
-	offset, length := abi.EncodeFatPointer(bytes)
-	publish_event_host(offset, length)
-}
-```
-
-## Step 4: Local Integration Testing
-
-You can fully test your Wasm plugin without running the actual host application. The `wasm-microkernel` SDK provides a `plugintest` harness powered by `wazero`.
-
-Create a `main_test.go` file:
-
-```go
-package main
-
-import (
-    "testing"
-    "github.com/your-org/wasm-microkernel/plugintest"
-)
-
-func TestPluginExecution(t *testing.T) {
-    // 1. Initialize the SDK's isolated test harness
-    harness := plugintest.NewHarness(t, "plugin.wasm")
-    
-    // 2. Mock the host capabilities your plugin requires
-    harness.MockHostFunction("host_env", "publish_event", func(offset, length uint32) {
-        // Intercept the event for assertions
+        body, err := guest.HttpPost("http://ollama.local/api/generate", reqJSON)
+        if err != nil {
+            return "", err
+        }
+        return body, nil
     })
-    
-    // 3. Invoke your exported Wasm function
-    exitCode := harness.CallExport("Execute", mockPayloadBytes)
-    if exitCode!= 0 {
-        t.Fatalf("Plugin execution failed")
-    }
 }
+
+// Required by the Go toolchain; never executed in reactor mode.
+func main() {}
 ```
 
-## Step 5: Compilation and Distribution
+You import only `github.com/gavmor/wasm-microkernel/guest`. There are no
+`//go:wasmimport` or `//go:wasmexport` directives in your plugin code —
+the SDK provides them.
 
-To compile your plugin, you must target the `wasip1` OS and use the `c-shared` build mode. This instructs the Go linker to skip generating a standard `_start` function and instead generate the special `_initialize` function required for the WASI Reactor pattern.
+### Available capabilities (today)
+
+| Function                          | Purpose                                  |
+| --------------------------------- | ---------------------------------------- |
+| `guest.LogMsg(msg string)`        | Fire-and-forget log line to the host.    |
+| `guest.HttpPost(url, body) (s, e)`| POST `body` to `url`; returns response.  |
+
+## Step 2: Compile the Plugin
+
+Plugins are **WASI Reactors** — long-lived modules whose exports are
+called many times. Use `c-shared` so the Go linker emits `_initialize`
+instead of `_start`:
 
 ```bash
 GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o my-plugin.wasm
 ```
 
-**Distribution via OCI Registry:**
+## Step 3: Run a Plugin from the Host
 
-The SDK supports dynamically fetching plugins from OCI-compliant container registries. This is the recommended approach as it provides built-in versioning and access control.
+```go
+package main
 
-Use the `oras` CLI to push your compiled Wasm binary:
+import (
+    "context"
+    "fmt"
+    "log"
+    "os"
 
-```bash 
-oras push ghcr.io/your-org/my-custom-plugin:v1.0.0 \
-  my-plugin.wasm:application/vnd.module.wasm.content.layer.v1+wasm
+    "github.com/gavmor/wasm-microkernel/host"
+)
+
+func main() {
+    ctx := context.Background()
+
+    engine, err := host.NewEngine(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer engine.Close(ctx)
+
+    wasmBytes, err := os.ReadFile("my-plugin.wasm")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    out, err := engine.Execute(ctx, wasmBytes, `{"episode_id":"123"}`)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(out)
+}
 ```
 
-End users can now configure the host application to load your plugin simply by providing the OCI URL.
+That is the entire host surface area:
+
+- `host.NewEngine(ctx) (*Engine, error)`
+- `(*Engine).Execute(ctx, wasmBytes []byte, reqJSON string) (string, error)`
+- `(*Engine).Close(ctx) error`
+
+The host application never imports `wazero`, never sees a pointer, and
+never marshals a fat pointer.
+
+## Wire Protocol
+
+You only need this if you are debugging at the byte level.
+
+- **Inputs and outputs** are passed as a single `i64` fat pointer:
+  `(uint64(ptr) << 32) | uint64(len)`.
+- **`execute(ptr, len) -> u64`** is the only plugin export the host
+  invokes. The plugin allocates its own response buffer and returns its
+  fat pointer.
+- **`allocate(size) -> u32`** is exported by the plugin so the host can
+  reserve guest memory for the request payload before calling `execute`.
+  `size == 0` is well-defined: the plugin returns `0` and the host skips
+  the write.
+- **Response framing:** the first byte of every `execute` and
+  `http_post` response is `0` (success) or `1` (error). The remaining
+  bytes are UTF-8.
+- **`http_post` request payload:** `"<url>\x00<body>"` so the host can
+  split URL from body without a second allocation.
+- All host capabilities live under the wazero module name
+  **`podpedia_host`** (e.g. `podpedia_host.log_msg`,
+  `podpedia_host.http_post`).
+
+## Concurrency and Lifecycle
+
+- `host.Execute` compiles, instantiates, runs, and closes a fresh module
+  per call. Heavy use should cache compiled modules in your own code.
+- `_initialize` runs on every instantiation, so plugin `init()`s execute
+  before `execute` is called.
+- Plugins must not assume thread safety; the wazero Go runtime is
+  single-threaded per module instance.
+
+## Local Development
+
+```bash
+go build ./...                                       # native: host SDK
+GOOS=wasip1 GOARCH=wasm go build ./guest             # cross-compile guest SDK
+go test ./...                                        # run tests
+```
+
+## Changelog
+
+- **v0.6.0** — Rewrote the SDK around a minimal fat-pointer protocol.
+  Removed `wit/`, `guest-bindings/`, `kernel/`, `capabilities/`, and
+  `plugintest/` packages. The host now exposes a single `Engine` type;
+  plugins import only the `guest` package.
