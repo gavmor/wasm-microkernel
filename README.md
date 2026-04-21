@@ -1,49 +1,44 @@
-# `wasm-microkernel` v0.6.0
+# `wasm-microkernel` v0.7.0
 
-A small Go SDK for embedding WebAssembly plugins in a host application,
-built directly on [`wazero`](https://github.com/tetratelabs/wazero) and
-`GOOS=wasip1 GOARCH=wasm`.
+A small Go SDK for embedding WebAssembly plugins in a host application.
+A thin facade over [Extism](https://extism.org/) (which uses
+[`wazero`](https://github.com/tetratelabs/wazero) under the hood).
 
 The SDK has one purpose: **give plugin authors the developer experience
 of the Component Model — Go strings in, Go strings out, capabilities
-that feel like standard library calls — using only the parts of the Go
-WebAssembly toolchain that actually work today.**
+that feel like standard library calls — using the most production-ready
+Wasm plugin framework available for Go today.**
 
 ## What This Is (and What It Isn't)
 
-This project is, candidly, an independent re-derivation of
-[**waPC**](https://wapc.io/) / a lightweight in-house variant of
-[**Extism**](https://extism.org/). That is on purpose, not by accident.
+This SDK is a **facade**. Plugin authors import only
+`github.com/gavmor/wasm-microkernel/guest`; host applications import
+only `github.com/gavmor/wasm-microkernel/host`. Behind both packages,
+Extism manages WASI, linear memory, the host-call boundary, and the
+allow-list-based HTTP capability.
 
-We started by chasing the Component Model — WIT files,
-`wit-bindgen-go`, `Result<T, E>` lifting, the works — and ran straight
-into the current state of the Go Wasm ecosystem:
+### Why a facade and not "just use Extism"?
 
-- Want the Component Model **today**? You're using Rust + `wasmtime`.
-- Want a **pure-Go** host runtime (`wazero`)? You're stuck on `wasip1`,
-  which means fat pointers and manual linear-memory management.
+The Extism API is broad and evolving. Pinning every plugin in your
+ecosystem to Extism's exact surface ties your plugin contract to a
+third-party release schedule. The microkernel here is a stable shim:
 
-We chose pure Go + `wazero`, so the Component Model dream had to be
-deferred. What we kept is the *experience* the Component Model
-promises, even though the plumbing underneath is `wasip1`.
-
-### Why not just use Extism or waPC directly?
-
-Off-the-shelf plugin frameworks dictate large parts of your application
-architecture — their SDK, their logging model, their capability surface,
-their distribution story. For a long-lived host that we want to evolve
-on our own terms, tightly coupling the core to a heavy third-party
-plugin framework is a liability. The microkernel here is small enough
-to read in an afternoon and bend in any direction we need.
+- Plugins write against `guest.Register / LogMsg / HttpPost`. Three
+  functions, plain Go types, zero `//go:wasmimport` directives.
+- Hosts write against `host.NewEngine().Execute(...)`. One method.
+- The day a better runtime ships (wazero's Component Model support,
+  `wit-bindgen-go` host bindings, a different framework entirely), the
+  internals of the two SDK files swap out and **plugin code does not
+  change**. That is the entire point of the architecture.
 
 ### The actual differentiator: plugin DevEx insulation
 
-Plugin authors never see a fat pointer. They write code like this:
+Plugin authors write code like this:
 
 ```go
 guest.Register(func(req string) (string, error) {
     guest.LogMsg("running...")
-    body, err := guest.HttpPost("http://ollama.local/api/generate", req)
+    body, err := guest.HttpPost("https://api.example.com/v1/things", req)
     if err != nil {
         return "", err
     }
@@ -51,64 +46,41 @@ guest.Register(func(req string) (string, error) {
 })
 ```
 
-That is the entire plugin contract. Standard `string`, standard `error`,
-capabilities that look and feel like the standard library. The
-microkernel is the only thing that knows the ABI is ugly underneath.
-
-### Forward path
-
-This positioning matters for the migration ahead. When `wazero` ships
-real Component Model support and `wit-bindgen-go` grows a usable host
-shim, **plugin code does not have to change**. We swap the internal
-implementation of `guest/` and `host/`, delete `abi/`, and let WIT
-handle the memory. The plugin's `Register` / `LogMsg` / `HttpPost`
-surface stays exactly as-is.
-
-The fat-pointer protocol described below is a temporary bridge over a
-missing feature in the Go compiler. It's ugly underneath; the traffic
-driving over it is safe.
-
-> **Why v0.6.0?** Earlier drafts of this repo experimented with WIT
-> definitions and `wit-bindgen-go`. In practice, `wit-bindgen-go` only
-> emits guest-side bindings and produces no host shim for `wazero`, so
-> the WIT layer added ceremony without simplifying anything. v0.6.0
-> drops WIT entirely in favor of the small fat-pointer protocol the
-> rest of this README describes.
+Standard `string`, standard `error`, capabilities that look and feel
+like the standard library. The microkernel is the only thing that knows
+the runtime is Extism underneath.
 
 ## Repository Layout
 
 ```text
 wasm-microkernel/
-├── abi/
-│   └── ptr.go         # Shared (ptr<<32 | len) fat-pointer encoding
 ├── guest/
-│   ├── guest.go       # Plugin-side: exports `allocate` and `execute`
-│   └── host_funcs.go  # Plugin-side: clean wrappers around //go:wasmimport
+│   └── guest.go     # Plugin-side SDK: Register, LogMsg, HttpPost
 └── host/
-    ├── engine.go      # Host-side: wazero wrapper and lifecycle
-    └── host_funcs.go  # Host-side: real implementations of capabilities
+    ├── engine.go    # Host-side SDK: Engine, NewEngine, Execute
+    └── engine_test.go
 ```
 
-Only `github.com/tetratelabs/wazero` is a direct dependency.
+Two source files, ~130 LOC. Direct dependencies are `extism/go-sdk` and
+`extism/go-pdk`.
 
 ## Architecture in One Picture
 
 ```
-┌──────────────────────┐                ┌────────────────────────┐
-│  Your host app       │                │  Your plugin (.wasm)   │
-│  (e.g. podpedia)     │                │  GOOS=wasip1           │
-│                      │                │                        │
-│  engine.Execute(…)   │ ── execute ──▶ │  guest.execute         │
-│                      │                │   └ pluginHandler(req) │
-│  hostHttpPost ◀───── │ ── http_post ──┤  guest.HttpPost(url,…) │
-│  hostLogMsg   ◀───── │ ── log_msg  ───┤  guest.LogMsg("…")     │
-└──────────────────────┘                └────────────────────────┘
-        host/                                     guest/
+┌──────────────────────┐                    ┌────────────────────────┐
+│  Your host app       │                    │  Your plugin (.wasm)   │
+│                      │                    │  GOOS=wasip1           │
+│  engine.Execute(…)   │ ── execute ──────▶ │  guest.execute         │
+│                      │                    │   └ pluginHandler(req) │
+│  Extism HTTP host    │ ◀─── http ─────────┤  guest.HttpPost(url,…) │
+│  (allow-list gate)   │                    │                        │
+│  Extism logger       │ ◀─── log ──────────┤  guest.LogMsg("…")     │
+└──────────────────────┘                    └────────────────────────┘
+        host/                                         guest/
 ```
 
-All cross-boundary values are encoded as a single 64-bit fat pointer
-(`ptr<<32 | len`) using `abi.Encode` / `abi.Decode`. Responses use a
-1-byte framing flag: `0` for success, `1` for an error string.
+All cross-boundary marshaling is Extism's job. The SDK does no pointer
+math, no fat-pointer encoding, no manual `linear-memory.Read/Write`.
 
 ## Prerequisites
 
@@ -132,7 +104,7 @@ func init() {
     guest.Register(func(reqJSON string) (string, error) {
         guest.LogMsg("running extractor for: " + reqJSON)
 
-        body, err := guest.HttpPost("http://ollama.local/api/generate", reqJSON)
+        body, err := guest.HttpPost("https://api.example.com/v1/things", reqJSON)
         if err != nil {
             return "", err
         }
@@ -144,16 +116,14 @@ func init() {
 func main() {}
 ```
 
-You import only `github.com/gavmor/wasm-microkernel/guest`. There are no
-`//go:wasmimport` or `//go:wasmexport` directives in your plugin code —
-the SDK provides them.
+You import only `github.com/gavmor/wasm-microkernel/guest`.
 
-### Available capabilities (today)
+### Available capabilities
 
-| Function                          | Purpose                                  |
-| --------------------------------- | ---------------------------------------- |
-| `guest.LogMsg(msg string)`        | Fire-and-forget log line to the host.    |
-| `guest.HttpPost(url, body) (s, e)`| POST `body` to `url`; returns response.  |
+| Function                          | Purpose                                              |
+| --------------------------------- | ---------------------------------------------------- |
+| `guest.LogMsg(msg string)`        | Fire-and-forget log line to the host.                |
+| `guest.HttpPost(url, body) (s, e)`| POST `body` to `url`; subject to host's allow-list.  |
 
 ## Step 2: Compile the Plugin
 
@@ -182,11 +152,9 @@ import (
 func main() {
     ctx := context.Background()
 
-    engine, err := host.NewEngine(ctx)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer engine.Close(ctx)
+    engine := host.NewEngine()
+    // Allow-list which hosts plugins may POST to. Empty = no HTTP.
+    engine.AllowedHosts = []string{"api.example.com"}
 
     wasmBytes, err := os.ReadFile("my-plugin.wasm")
     if err != nil {
@@ -203,54 +171,55 @@ func main() {
 
 That is the entire host surface area:
 
-- `host.NewEngine(ctx) (*Engine, error)`
+- `host.NewEngine() *Engine`
+- `(*Engine).AllowedHosts []string` — glob patterns Extism enforces.
 - `(*Engine).Execute(ctx, wasmBytes []byte, reqJSON string) (string, error)`
-- `(*Engine).Close(ctx) error`
+- `(*Engine).Close(ctx) error` — no-op today; reserved for future
+  resource pools.
 
-The host application never imports `wazero`, never sees a pointer, and
-never marshals a fat pointer.
+The host application never imports `extism` or `wazero`.
 
-## Wire Protocol
+## Security: AllowedHosts
 
-You only need this if you are debugging at the byte level.
+`Engine.AllowedHosts` is passed directly to Extism's `Manifest`. Patterns
+match the **hostname only** (no scheme, no port). An empty list means
+**no plugin can make outbound HTTP calls** — a safe default.
 
-- **Inputs and outputs** are passed as a single `i64` fat pointer:
-  `(uint64(ptr) << 32) | uint64(len)`.
-- **`execute(ptr, len) -> u64`** is the only plugin export the host
-  invokes. The plugin allocates its own response buffer and returns its
-  fat pointer.
-- **`allocate(size) -> u32`** is exported by the plugin so the host can
-  reserve guest memory for the request payload before calling `execute`.
-  `size == 0` is well-defined: the plugin returns `0` and the host skips
-  the write.
-- **Response framing:** the first byte of every `execute` and
-  `http_post` response is `0` (success) or `1` (error). The remaining
-  bytes are UTF-8.
-- **`http_post` request payload:** `"<url>\x00<body>"` so the host can
-  split URL from body without a second allocation.
-- All host capabilities live under the wazero module name
-  **`podpedia_host`** (e.g. `podpedia_host.log_msg`,
-  `podpedia_host.http_post`).
+```go
+engine.AllowedHosts = []string{
+    "*.deepgram.com",   // glob: any subdomain
+    "api.openai.com",   // exact hostname
+    "127.0.0.1",        // any port on loopback (useful for httptest)
+}
+```
+
+Plugins that try to reach a non-allow-listed host receive an HTTP error
+through `guest.HttpPost`, which they can surface to the caller.
 
 ## Concurrency and Lifecycle
 
-- `host.Execute` compiles, instantiates, runs, and closes a fresh module
-  per call. Heavy use should cache compiled modules in your own code.
-- `_initialize` runs on every instantiation, so plugin `init()`s execute
-  before `execute` is called.
-- Plugins must not assume thread safety; the wazero Go runtime is
-  single-threaded per module instance.
+- `host.Execute` boots a fresh Extism plugin per call, runs `execute`,
+  and tears it down. Concurrent calls on one `Engine` are safe; each
+  call gets an isolated plugin instance with its own linear memory.
+- `_initialize` runs on every instantiation, so plugin `init()`s
+  (including `guest.Register`) execute before `execute` is called.
 
 ## Local Development
 
 ```bash
 go build ./...                                       # native: host SDK
 GOOS=wasip1 GOARCH=wasm go build ./guest             # cross-compile guest SDK
-go test ./...                                        # run tests
+go generate ./host/...                               # rebuild host/testdata/ping.wasm
+go test ./...                                        # run integration tests
 ```
 
 ## Changelog
 
+- **v0.7.0** — Replaced the hand-rolled fat-pointer ABI with an Extism
+  facade. Deleted `abi/`, `host/host_funcs.go`, `guest/host_funcs.go`,
+  `host/builder.go`. SDK shrank from ~370 LOC to ~130 LOC. Plugin code
+  did not change. `Engine.AllowedHosts` is the new security gate for
+  outbound HTTP, replacing the old unrestricted `hostHttpPost`.
 - **v0.6.0** — Rewrote the SDK around a minimal fat-pointer protocol.
   Removed `wit/`, `guest-bindings/`, `kernel/`, `capabilities/`, and
   `plugintest/` packages. The host now exposes a single `Engine` type;

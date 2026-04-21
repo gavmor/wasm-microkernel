@@ -3,11 +3,9 @@
 The standard Go way to integration test a WebAssembly harness is the
 **testdata pattern** combined with a dedicated *Ping* (or *Echo*)
 plugin. You do not want to use real production plugins for this — they
-carry too much baggage (Ollama instances, audio files, network access,
-real credentials). Instead, write a tiny deterministic Wasm plugin
-whose only job is to exercise the boundaries of the SDK and prove that
-allocation, parameter passing, and host capabilities are wired up
-correctly.
+carry too much baggage (real services, real credentials, network
+dependencies). Instead, write a tiny deterministic Wasm plugin whose
+only job is to exercise the boundaries of the SDK.
 
 This guide is the playbook for setting up that test suite, both inside
 this repository and inside any host application that embeds it.
@@ -20,9 +18,9 @@ In the package whose tests you want to write (here, `host/`), create a
 `testdata/ping/` directory and write a minimal plugin that:
 
 1. Echoes its input back wrapped in a deterministic envelope.
-2. Triggers a host capability so you can prove the import side works.
-3. Returns an error on a known sentinel input so you can test the error
-   path too.
+2. Triggers a host capability (log, HTTP) so the import side is covered.
+3. Returns an error on a known sentinel input so the error path is
+   covered too.
 
 **`host/testdata/ping/main.go`**
 
@@ -33,25 +31,31 @@ package main
 
 import (
     "fmt"
+    "strings"
 
     "github.com/gavmor/wasm-microkernel/guest"
 )
 
 func init() {
     guest.Register(func(reqJSON string) (string, error) {
-        if reqJSON == "crash" {
+        switch {
+        case reqJSON == "crash":
             return "", fmt.Errorf("simulated plugin error")
+        case reqJSON == "":
+            return `{"status":"pong","echo":null}`, nil
+        case strings.HasPrefix(reqJSON, "POST "):
+            // Format: "POST <url> <body>" — exercises guest.HttpPost.
+            rest := strings.TrimPrefix(reqJSON, "POST ")
+            sp := strings.IndexByte(rest, ' ')
+            url, body := rest[:sp], rest[sp+1:]
+            return guest.HttpPost(url, body)
         }
 
-        // Exercise the host log capability so the import side is covered.
         guest.LogMsg("ping received: " + reqJSON)
-
-        // Deterministic, easy-to-assert response.
         return `{"status":"pong","echo":` + reqJSON + `}`, nil
     })
 }
 
-// Required by the Go toolchain; never executed in reactor mode.
 func main() {}
 ```
 
@@ -68,10 +72,8 @@ machine from trying to compile the plugin source as a host package.
 ## 2. Pre-compile the Plugin via `go:generate`
 
 You generally do not want `go test` shelling out to compile Wasm on the
-fly: CI environments may lack the right toolchain, and it slows the
-test loop. Compile the plugin once with a `//go:generate` directive
-sitting next to the test file, and check the resulting `.wasm` into
-the repository.
+fly. Compile the plugin once with a `//go:generate` directive sitting
+next to the test file, and check the resulting `.wasm` into the repo.
 
 **`host/engine_test.go`** (top of file)
 
@@ -79,14 +81,6 @@ the repository.
 package host_test
 
 //go:generate env GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o testdata/ping.wasm ./testdata/ping
-
-import (
-    "context"
-    "os"
-    "testing"
-
-    "github.com/gavmor/wasm-microkernel/host"
-)
 ```
 
 Run it once when the plugin source changes:
@@ -106,32 +100,25 @@ host/testdata/*.wasm binary
 
 ## 3. Write the Integration Tests
 
-These are ordinary `go test` cases. They prove that:
-
-- the engine boots,
-- the plugin is loaded and `_initialize` runs (so `init()` registers
-  the handler),
-- the request crosses the boundary intact,
-- the response is unframed correctly,
-- a plugin-side error is surfaced as a Go `error`.
+These are ordinary `go test` cases. They prove that the engine boots,
+the plugin's `init()` runs, the request crosses the boundary intact,
+the response is unwrapped correctly, and a plugin-side error is
+surfaced as a Go `error`.
 
 ```go
 func TestEngine_Execute_Success(t *testing.T) {
-    ctx := context.Background()
-
     wasmBytes, err := os.ReadFile("testdata/ping.wasm")
     if err != nil {
         t.Fatalf("read test plugin: %v", err)
     }
 
-    engine, err := host.NewEngine(ctx)
-    if err != nil {
-        t.Fatalf("new engine: %v", err)
-    }
-    defer engine.Close(ctx)
+    eng := host.NewEngine()
+    defer eng.Close(context.Background())
 
-    payload := `"hello host"`
-    got, err := engine.Execute(ctx, wasmBytes, payload)
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    got, err := eng.Execute(ctx, wasmBytes, `"hello host"`)
     if err != nil {
         t.Fatalf("execute: %v", err)
     }
@@ -143,38 +130,33 @@ func TestEngine_Execute_Success(t *testing.T) {
 }
 
 func TestEngine_Execute_PluginError(t *testing.T) {
-    ctx := context.Background()
-
     wasmBytes, err := os.ReadFile("testdata/ping.wasm")
     if err != nil {
         t.Fatalf("read test plugin: %v", err)
     }
 
-    engine, err := host.NewEngine(ctx)
-    if err != nil {
-        t.Fatalf("new engine: %v", err)
-    }
-    defer engine.Close(ctx)
+    eng := host.NewEngine()
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
 
-    _, err = engine.Execute(ctx, wasmBytes, "crash")
+    _, err = eng.Execute(ctx, wasmBytes, "crash")
     if err == nil {
         t.Fatal("expected an error from plugin, got none")
     }
 
-    const want = "plugin logic error: simulated plugin error"
-    if err.Error() != want {
-        t.Errorf("want %q, got %q", want, err.Error())
+    // Extism wraps pdk.SetError messages; assert on the inner text only.
+    if !strings.Contains(err.Error(), "simulated plugin error") {
+        t.Errorf("unexpected error: %v", err)
     }
 }
 ```
 
 Two things worth noticing:
 
-- `host.NewEngine` returns `(*Engine, error)` — always check both.
-  Reuse the engine across sub-tests when you can; `Execute` is safe
-  to call concurrently (see the integration guide, §5).
-- `defer engine.Close(ctx)` matters even in tests, so the wazero
-  runtime's background goroutines are released between cases.
+- `host.NewEngine()` takes no arguments and returns no error. It is
+  free; you can call it per test.
+- Always wrap `Execute` in a `context.WithTimeout` — Extism boots wazero
+  internally, which can in pathological cases hang on a malformed module.
 
 ---
 
@@ -183,58 +165,27 @@ Two things worth noticing:
 Once the happy path passes, add cases that pin down the contract at
 its corners:
 
-| Case                                        | What it proves                           |
-| ------------------------------------------- | ---------------------------------------- |
-| Empty request (`engine.Execute(ctx, w, "")`)| `allocate(0)` is well-defined.           |
-| Very large request (e.g. 1 MiB JSON)        | The fat-pointer path handles big buffers.|
-| Concurrent calls to one engine              | Per-call module isolation works.         |
-| `context.WithTimeout` shorter than a sleep  | Plugin trapping on cancel is contained.  |
-| Re-running the same plugin many times       | No leak in module instantiate/close.     |
+| Case                                        | What it proves                                    |
+| ------------------------------------------- | ------------------------------------------------- |
+| Empty request (`engine.Execute(ctx, w, "")`)| Empty input crosses the boundary cleanly.         |
+| Very large request (e.g. 256 KiB JSON)      | Extism handles non-trivial buffers.               |
+| Concurrent calls to one engine              | Per-call instance isolation works.                |
+| Re-running the same plugin many times       | No leak in instantiate/close.                     |
+| `context.WithTimeout` shorter than work     | Plugin cancellation is contained.                 |
+| `HttpPost` against an `httptest.Server`     | AllowedHosts gating + HTTP capability work.       |
 
 Each is a 10-line test against the same `ping.wasm` — the plugin only
-needs a couple of new branches (e.g. a `"sleep"` input that calls
-`time.Sleep`).
+needs a couple of new branches.
 
 ---
 
-## 5. Mocking Host Capabilities
+## 5. Testing `guest.HttpPost`
 
-Eventually you will want to test plugins that call `guest.HttpPost`
-without hitting the network. The SDK does not expose a hook for this
-out of the box, but the change to add one is small and entirely on
-the host side.
-
-The general shape:
-
-1. Promote the HTTP client used by `host/host_funcs.go::hostHttpPost`
-   to a field on `Engine` (today it implicitly uses
-   `http.DefaultClient`).
-2. Add a constructor — e.g. `NewEngineWithClient(ctx, *http.Client)` —
-   that sets that field.
-3. Have `hostHttpPost` read the client from the captured `Engine`
-   instead of calling `http.Post` directly.
-
-Sketch:
-
-```go
-type Engine struct {
-    runtime    wazero.Runtime
-    httpClient *http.Client
-}
-
-func NewEngineWithClient(ctx context.Context, client *http.Client) (*Engine, error) {
-    // Same setup as NewEngine, but stash `client` on the struct and
-    // capture `e` in the closure when registering the http_post import:
-    //
-    //   .NewFunctionBuilder().
-    //       WithFunc(func(ctx context.Context, mod api.Module, packed uint64) uint64 {
-    //           return e.hostHttpPost(ctx, mod, packed)
-    //       }).
-    //       Export("http_post").
-}
-```
-
-Then in tests:
+Unlike most plugin frameworks, you do **not** need to mock the HTTP
+client to test capability-driven plugins. Extism's HTTP capability is
+already host-implemented (it uses Go's `net/http`), so an
+`httptest.Server` works out of the box — you just have to add its host
+to `Engine.AllowedHosts`:
 
 ```go
 srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -243,34 +194,36 @@ srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.R
 }))
 defer srv.Close()
 
-engine, err := host.NewEngineWithClient(ctx, srv.Client())
+eng := host.NewEngine()
+eng.AllowedHosts = []string{"127.0.0.1"}  // httptest binds to 127.0.0.1
+
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+// ping plugin parses "POST <url> <body>" and calls guest.HttpPost.
+payload := "POST " + srv.URL + "/echo " + `{"hello":"world"}`
+got, err := eng.Execute(ctx, wasmBytes, payload)
 ```
 
-The plugin's `guest.HttpPost("http://anything/...", body)` call still
-flows through the host boundary, but the host now resolves it against
-your `httptest.Server` instead of the real internet. Note that your
-plugin will need to be told to call `srv.URL` (passed in via the
-request payload), since `httptest` issues a fresh URL per test.
-
-If you need finer-grained control — per-call assertions, per-URL
-allowlists, recording fixtures — replace `*http.Client` with an
-interface like `http.RoundTripper` and inject a fake of your own.
+This is more honest than mocking the client: it exercises the real
+allow-list gate, the real HTTP serialization, and the real response
+read-back, end to end.
 
 ---
 
 ## 6. CI Considerations
 
 - **Commit the `.wasm` artifact.** This avoids requiring `wasip1` /
-  `wasm` toolchains in CI just to run host tests. The Go toolchain
-  built into your CI image is typically enough on its own.
+  `wasm` toolchains in CI just to run host tests.
 - **Re-run `go generate` in a separate CI job** if you want to detect
   drift between the committed `.wasm` and the test plugin source. Make
   it fail if `git diff --exit-code host/testdata/` reports changes.
 - **Run host tests with the race detector** (`go test -race ./host/...`).
-  The wazero runtime is safe for concurrent use; the race detector
-  catches misuse of the engine in your own code.
-- **Skip Wasm tests gracefully** if a downstream consumer's CI cannot
-  run them, e.g. `if _, err := os.Stat("testdata/ping.wasm"); err != nil { t.Skip(...) }`.
+  Extism is safe for concurrent use; the race detector catches misuse
+  of the engine in your own code.
+- **Fail loudly on missing artifacts.** If `testdata/ping.wasm` is
+  absent, prefer `t.Fatal` over `t.Skip` — a missing artifact in your
+  own repo means `go generate` was not run.
 
 ---
 
@@ -278,13 +231,13 @@ interface like `http.RoundTripper` and inject a fake of your own.
 
 - **Determinism.** A purpose-built `ping` plugin has no external
   dependencies, no clocks, no randomness — every assertion is exact.
-- **Isolation.** Bugs in production plugins (extractor, transcriber)
-  cannot break your harness tests, and vice versa.
+- **Isolation.** Bugs in production plugins cannot break your harness
+  tests, and vice versa.
 - **Speed.** Tests do not shell out to compile anything; they read a
-  committed `.wasm` and run wazero in-process.
+  committed `.wasm` and run Extism in-process.
 - **Coverage of the boundary.** The plugin exercises both directions
-  (host → guest via `execute`; guest → host via `LogMsg`), so a
-  regression in either path fails loudly.
+  (host → guest via `execute`; guest → host via `LogMsg` and
+  `HttpPost`), so a regression in either path fails loudly.
 
 That is the entire integration-testing surface. Once `ping.wasm` is in
 place, every new SDK feature gets a one-branch addition to the plugin

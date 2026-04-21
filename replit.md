@@ -1,35 +1,33 @@
 # wasm-microkernel
 
 A Go SDK for building host applications and WebAssembly plugins on top of
-wazero + wasip1. The SDK hides all fat-pointer / linear-memory bookkeeping
-behind two small packages so plugin authors and host applications never
-touch raw Wasm ABI.
+[Extism](https://extism.org/) (which uses [wazero](https://wazero.io)
+under the hood). The SDK is a thin facade: plugin authors and host
+applications never touch Extism types or memory APIs.
 
 ## Project Type
 
 Go library (no frontend/backend, no runnable web app).
 
-## Layout (v0.6.0)
+## Layout (v0.7.0)
 
-- `abi/ptr.go` — shared `Encode` / `Decode` for the `(ptr<<32 | len)` fat-pointer
-  protocol used on both sides of the boundary.
-- `guest/` *(`//go:build wasip1`)* — plugin-side SDK.
-  - `guest.go` exports `allocate` and `execute`; plugins call `Register(handler)`
-    from `init()`.
-  - `host_funcs.go` wraps the raw `//go:wasmimport` declarations under the
-    `podpedia_host` module (`log_msg`, `http_post`).
-- `host/` — embed-side SDK.
-  - `engine.go` — `Engine` wraps wazero, instantiates the `podpedia_host`
-    capability module, and exposes `Execute(ctx, wasmBytes, reqJSON)`.
-  - `host_funcs.go` — Go implementations of the host capabilities.
+- `guest/guest.go` *(`//go:build wasip1`)* — plugin-side SDK. Wraps the
+  Extism PDK and exposes `Register`, `LogMsg`, `HttpPost`. Exports the
+  canonical `execute` symbol the host engine invokes.
+- `host/engine.go` — embed-side SDK. `Engine` wraps Extism, with an
+  `AllowedHosts` field that controls outbound HTTP from plugins. Exposes
+  `Execute(ctx, wasmBytes, reqJSON)`.
+- `host/engine_test.go` — integration tests (7 cases; ~12 s total).
+- `host/testdata/ping/` — minimal echo/error/log/http test plugin source.
+- `host/testdata/ping.wasm` — committed pre-compiled artifact.
 
-The plugin/host wire format prefixes every `execute`/`http_post` response
-with one byte: `0` for success, `1` for an error string.
+That is the entire SDK: two source files, ~130 LOC.
 
 ## Stack
 
 - Go 1.26.1
-- `github.com/tetratelabs/wazero` v1.11.0 — only direct dependency.
+- `github.com/extism/go-sdk` — host runtime (wraps wazero).
+- `github.com/extism/go-pdk` — guest plugin development kit.
 
 ## Replit Setup
 
@@ -39,7 +37,8 @@ server to deploy.
 ## Common Commands
 
 ```bash
-go build ./...
-go test ./...
-GOOS=wasip1 GOARCH=wasm go build ./guest   # cross-compile guest SDK
+go build ./...                                                    # native: host SDK
+GOOS=wasip1 GOARCH=wasm go build ./guest                          # verify guest SDK cross-compiles
+go generate ./host/...                                            # rebuild host/testdata/ping.wasm
+go test ./...                                                     # run integration tests
 ```

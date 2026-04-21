@@ -1,0 +1,55 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test-example:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust:
+          - stable
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          path: go-pdk
+      - uses: ./go-pdk/.github/actions/libextism
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cp go-pdk/go.sum . # Needed to get setup-go to work
+
+      - name: Install Go
+        uses: actions/setup-go@v3
+        with:
+          cache: true
+          go-version: '1.21.3'
+
+      - name: Install TinyGo
+        uses: acifani/setup-tinygo@v1.1.0
+        with:
+          tinygo-version: 0.34.0
+          binaryen-version: "116"
+
+      - name: Compile example
+        working-directory: go-pdk
+        run: |
+          ls -a example
+          make -B example
+
+      - name: Test example
+        working-directory: go-pdk
+        run: |
+          # --wasi is needed as there is currently some issue compiling Go PDK plugins without wasi
+
+          TEST=$(extism call example/tiny_countvowels.wasm --wasi --github-token="$GITHUB_TOKEN" --input "this is a test" --set-config='{"thing": "1", "a": "b"}' count_vowels)
+          echo $TEST | grep '"count": 4'
+          echo $TEST | grep '"config": "1"'
+          echo $TEST | grep '"a": "this is var a"'
+
+          extism call example/tiny_http.wasm --wasi http_get --github-token="$GITHUB_TOKEN" --allow-host "jsonplaceholder.typicode.com" | grep '"userId": 1'
+
+          extism call example/tiny_reactor.wasm read_file --input "example/reactor/test.txt" --allow-path ./example/reactor --wasi --log-level info | grep 'Hello World!'
+
+          # run all the tests
+          make test

@@ -14,16 +14,15 @@ If you are writing the **plugin** rather than the host, see the README
 
 Embedding the SDK into your program gives you:
 
-- A single `host.Engine` value that owns one `wazero` runtime and the
-  pre-mounted host-capability module (`podpedia_host`).
+- A single `host.Engine` value that owns no resources directly but
+  delegates plugin execution to Extism (which uses `wazero` internally).
 - A single call — `engine.Execute(ctx, wasmBytes, reqJSON)` — that
-  compiles, instantiates, runs, and tears down a plugin.
-- Zero exposure to fat pointers, linear memory, or `wazero` types in
-  your application code. Plugins are opaque `[]byte`; requests and
-  responses are opaque `string`.
-
-What you do **not** get out of the box (and how to add it) is covered
-later in this document under "Going Beyond the Defaults."
+  boots, runs, and tears down a plugin.
+- An `AllowedHosts` field that declaratively controls which URLs your
+  plugins can reach over HTTP.
+- Zero exposure to Extism, `wazero`, or linear memory in your
+  application code. Plugins are opaque `[]byte`; requests and responses
+  are opaque `string`.
 
 ---
 
@@ -33,16 +32,16 @@ later in this document under "Going Beyond the Defaults."
 go get github.com/gavmor/wasm-microkernel@latest
 ```
 
-The SDK pulls in exactly one transitive dependency,
-`github.com/tetratelabs/wazero`. Import the host package wherever you
-plan to load plugins:
+The SDK pulls in `github.com/extism/go-sdk` and its transitive
+dependencies (Extism, `wazero`, OpenTelemetry plumbing). Import the host
+package wherever you plan to load plugins:
 
 ```go
 import "github.com/gavmor/wasm-microkernel/host"
 ```
 
-You do **not** import `abi/` or `guest/` from your host code — those
-are for the plugin side and the cross-boundary protocol respectively.
+You do **not** import `guest/` from your host code — that package is
+`//go:build wasip1`-gated and only compiles for plugins.
 
 ---
 
@@ -65,11 +64,8 @@ import (
 func main() {
     ctx := context.Background()
 
-    engine, err := host.NewEngine(ctx)
-    if err != nil {
-        log.Fatalf("engine: %v", err)
-    }
-    defer engine.Close(ctx)
+    engine := host.NewEngine()
+    engine.AllowedHosts = []string{"api.example.com"}
 
     wasmBytes, err := os.ReadFile("plugins/extractor.wasm")
     if err != nil {
@@ -91,65 +87,29 @@ hardening for production hosts.
 
 ## 4. Engine Lifecycle
 
-`host.Engine` is meant to be **created once and reused**. Creating a new
-engine per request is wasteful — each engine spins up a fresh `wazero`
-runtime and re-mounts the capability module. A single engine is also
-safe to share across goroutines, with the caveat in §5.
+`host.Engine` is a lightweight value type. `NewEngine()` allocates
+nothing besides the struct itself; the cost lives in each `Execute`
+call, where Extism instantiates the plugin. You can:
 
-Recommended pattern in a long-running service:
+- Create one engine at startup and share it across goroutines.
+- Create a fresh engine per request (fine; it is cheap).
+- Mutate `AllowedHosts` between calls (each `Execute` snapshots it into
+  the Extism manifest).
 
-```go
-type Service struct {
-    engine *host.Engine
-    // ... your other fields ...
-}
-
-func NewService(ctx context.Context) (*Service, error) {
-    eng, err := host.NewEngine(ctx)
-    if err != nil {
-        return nil, fmt.Errorf("plugin engine: %w", err)
-    }
-    return &Service{engine: eng}, nil
-}
-
-func (s *Service) Shutdown(ctx context.Context) error {
-    return s.engine.Close(ctx)
-}
-```
-
-`Close` releases the `wazero` runtime and any compiled modules it cached.
-Always `Close` the engine on shutdown — preferably via `defer` or a
-signal handler — so background goroutines and file descriptors held by
-`wazero` are released cleanly.
+`Close(ctx)` is a no-op today, retained for API stability in case future
+versions add per-engine pools.
 
 ---
 
 ## 5. Concurrency Model
 
-Each call to `engine.Execute` performs five steps in order:
+Each call to `engine.Execute` boots a fresh Extism plugin instance,
+calls `execute`, and tears it down. Because every call gets its own
+instance, **concurrent calls on the same `Engine` are safe** — they do
+not share linear memory or Go runtime state.
 
-1. Compile the plugin bytes.
-2. Instantiate a fresh module (which runs `_initialize`, including the
-   plugin's `init()` functions).
-3. Allocate guest memory for the request and write it.
-4. Call `execute(ptr, len)`.
-5. Read and unframe the response, then close the module instance.
-
-Because every call gets its own module instance, **concurrent calls to
-the same `Engine` are safe** — they do not share guest linear memory.
-
-Two practical implications:
-
-- **You can call `Execute` from many goroutines.** The capability host
-  functions (`hostHttpPost`, `hostLogMsg`) receive a per-call `api.Module`
-  from `wazero`, so they always read and write the right instance's
-  memory.
-- **A single plugin instance is single-threaded.** Inside one `execute`
-  call, the plugin's Go runtime runs on one goroutine. Plugins do not
-  need to be reentrancy-safe with respect to themselves.
-
-If your throughput is high and compilation cost matters, see
-"Caching Compiled Modules" in §10.
+A single plugin instance is single-threaded inside one `execute` call;
+plugins do not need to be reentrancy-safe with respect to themselves.
 
 ---
 
@@ -176,7 +136,7 @@ func Run[Req any, Resp any](
 
     respJSON, err := eng.Execute(ctx, wasmBytes, string(reqJSON))
     if err != nil {
-        return zero, err // already framed by the SDK
+        return zero, err
     }
 
     var resp Resp
@@ -187,16 +147,15 @@ func Run[Req any, Resp any](
 }
 ```
 
-The SDK's response framing — first byte `0` for success, `1` for
-error — is decoded for you. By the time `Execute` returns:
+When `Execute` returns:
 
-- A non-nil `error` means the plugin trapped, returned a framed error,
-  or the host could not allocate / read guest memory. The `error` text
-  already includes the plugin's message.
-- A nil `error` plus a `string` is the plugin's success payload, with
-  the framing byte already stripped.
+- A non-nil `error` means the plugin trapped, called `pdk.SetError`
+  (which Extism surfaces as the error text), or Extism itself failed to
+  load the module. The error text already includes the plugin's message.
+- A nil `error` plus a `string` is the plugin's success payload.
 
-You do not need to inspect the first byte yourself.
+You do not handle any framing bytes, exit codes, or memory pointers
+yourself.
 
 ---
 
@@ -222,113 +181,76 @@ wasmBytes, err := pluginsFS.ReadFile("plugins/extractor.wasm")
 ```
 
 **From an OCI registry** (recommended for third-party / versioned
-plugins):
+plugins): use `oras-go` or your registry client of choice and pass the
+resulting bytes to `Execute`.
 
-The SDK does not include an OCI client to keep dependencies minimal.
-Use `oras-go` or your registry client of choice to pull the
-`application/vnd.module.wasm.content.layer.v1+wasm` layer and pass the
-bytes to `Execute`.
-
-Whichever source you choose, treat the resulting `[]byte` as immutable
-and cache it — re-reading from disk on every request is wasteful and
-defeats the compiled-module cache (§10).
+Treat the resulting `[]byte` as immutable and cache it — re-reading
+from disk on every request is wasteful.
 
 ---
 
 ## 8. Error Handling
 
-The errors `Execute` can return fall into a few categories. Handle them
-the same way you would handle any external dependency:
+The errors `Execute` can return fall into a few categories:
 
-| Category               | What it looks like                                     | Typical response                     |
-| ---------------------- | ------------------------------------------------------ | ------------------------------------ |
-| Bad plugin binary      | `compiling plugin: …`                                  | Reject upload; log; alert.           |
-| Missing exports        | `plugin missing 'allocate' export`                     | Plugin is not built against the SDK. |
-| Trap / panic in guest  | `plugin execution trapped: …`                          | Surface to caller; do not retry.     |
-| Plugin business error  | `plugin logic error: <plugin's own message>`           | Surface to caller.                   |
-| Empty / malformed reply| `plugin returned empty response`, `reading result …`   | Likely SDK-version mismatch.         |
+| Category               | What it looks like                            | Typical response                    |
+| ---------------------- | --------------------------------------------- | ----------------------------------- |
+| Bad plugin binary      | `initializing plugin: …`                      | Reject upload; log; alert.          |
+| Trap / panic in guest  | `plugin error: <wasm trap text>`              | Surface to caller; do not retry.    |
+| Plugin business error  | `plugin error: <pdk.SetError message>`        | Surface to caller.                  |
+| Disallowed HTTP        | Plugin's own error from `guest.HttpPost`      | Caller decides; usually log+reject. |
+| Non-zero exit code     | `plugin exited with code N`                   | Plugin contract violation.          |
 
-A plugin trap is **not** fatal to your host process — `wazero` contains
-the trap inside the module instance, which is closed before `Execute`
-returns. You can immediately call `Execute` again with a fresh plugin
-or different input.
+A plugin trap is **not** fatal to your host process — Extism contains
+the trap inside the plugin instance, which is closed before `Execute`
+returns. You can immediately call `Execute` again.
 
 ---
 
 ## 9. Logging
 
-Plugins that call `guest.LogMsg(...)` produce one line per call on the
-host's standard output, prefixed with `[PLUGIN LOG]:`. This is
-intentionally simple. If you want structured logging, redirect or
-replace the implementation by editing `host/host_funcs.go` to write to
-your `slog.Logger` of choice. The capability surface is small enough
-that forking the function is a one-line change.
+Plugins that call `guest.LogMsg(...)` produce one log line per call
+through Extism's logger. By default Extism writes to its configured
+logger sink; the SDK does not currently override this. If you want to
+route plugin logs into your `slog.Logger`, configure Extism's logger
+directly via the upstream `extism.SetLogLevel` / log functions before
+boot.
 
 ---
 
 ## 10. Going Beyond the Defaults
 
-These are the most common production needs not covered by the
-out-of-the-box SDK. Each is a small, well-scoped change.
+### Restricting `http_post`
 
-### Caching Compiled Modules
-
-`Execute` calls `runtime.CompileModule` on every invocation. Compilation
-is expensive; instantiation is cheap. If you call the same plugin
-repeatedly, cache the compiled module yourself:
+This is built in. Set `Engine.AllowedHosts` to the list of glob patterns
+plugins are permitted to POST to. Patterns match the hostname only:
 
 ```go
-type CachedEngine struct {
-    eng      *host.Engine
-    runtime  wazero.Runtime
-    compiled sync.Map // map[plugin name] wazero.CompiledModule
+engine.AllowedHosts = []string{
+    "*.deepgram.com",
+    "api.openai.com",
+    "127.0.0.1",
 }
 ```
 
-This requires a small fork of `host.Execute` that takes a
-`wazero.CompiledModule` instead of `[]byte`. The wire protocol is
-unchanged.
-
-### Restricting `http_post`
-
-The default `http_post` capability calls `net/http` with no allowlist —
-plugins can reach any URL the host can. For untrusted plugins, fork
-`host/host_funcs.go::hostHttpPost` and consult an allowlist or per-plugin
-policy before issuing the request. Because policies are usually
-plugin-specific, a clean pattern is to thread a `policy` parameter
-through `NewEngine` and capture it in the closure when you register the
-host module.
+An empty list disables outbound HTTP entirely. Plugins that attempt a
+disallowed POST receive an HTTP error through `guest.HttpPost`.
 
 ### Adding New Capabilities
 
-The full list of plugin-visible host functions is the chain in
-`host/engine.go::NewEngine`:
-
-```go
-r.NewHostModuleBuilder("podpedia_host").
-    NewFunctionBuilder().WithFunc(hostLogMsg).Export("log_msg").
-    NewFunctionBuilder().WithFunc(hostHttpPost).Export("http_post").
-    Instantiate(ctx)
-```
-
-To add `file_read`, for example:
-
-1. Append `.NewFunctionBuilder().WithFunc(hostFileRead).Export("file_read")`
-   to that chain.
-2. Implement `hostFileRead(ctx context.Context, mod api.Module, packed uint64) uint64`
-   in `host/host_funcs.go`, decoding the request with `abi.Decode` and
-   writing the response back via the existing `writeBack` helper.
-3. Add a corresponding `//go:wasmimport podpedia_host file_read` and a
-   clean wrapper to `guest/host_funcs.go` so plugins can call it as
-   `guest.FileRead(...)`.
-
-Match the `0`/`1` framing convention in the response so existing plugin
-code continues to work the same way.
+The current SDK exposes Extism's built-in HTTP and logging. To add a
+custom host capability (e.g. `file_read`, `secret_get`), extend
+`host/engine.go` to construct an Extism `HostFunction` and pass it as
+the fourth argument to `extism.NewPlugin`. Then add a thin wrapper to
+`guest/guest.go` that calls `pdk.HostFunctionCall(name, payload)`.
+This requires understanding the upstream Extism API; the README
+intentionally does not document it because the built-in capabilities
+cover most needs.
 
 ### Per-Call Timeouts
 
 `Execute` honors the `context.Context` you pass it. A `context.WithTimeout`
-will trap the plugin if it runs too long:
+will cancel the plugin if it runs too long:
 
 ```go
 callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -343,17 +265,16 @@ usage; do not omit this in production.
 
 ## 11. Checklist Before Shipping
 
-- [ ] `host.Engine` is created once and shared across requests.
-- [ ] `engine.Close(ctx)` runs on shutdown.
+- [ ] `Engine.AllowedHosts` is set to the minimum set of hostnames your
+      plugins actually need (or empty if they do not need HTTP).
 - [ ] Every `Execute` call is wrapped in a `context.WithTimeout`.
-- [ ] Compiled modules are cached if the same plugin runs many times.
-- [ ] `http_post` is either disabled or backed by a per-plugin allowlist
-      if you load untrusted plugins.
 - [ ] Plugin `[]byte` is loaded once and reused — not re-read per call.
-- [ ] Errors from `Execute` are surfaced to the caller verbatim; the
-      framing byte is already handled.
+- [ ] Errors from `Execute` are surfaced to the caller verbatim.
+- [ ] If you load untrusted third-party plugins, you have an
+      out-of-band review process — Extism sandboxes execution, but the
+      capability surface (HTTP, logs) is still attack surface.
 
 That is the complete integration surface. The SDK is small on purpose:
-the parts you need to fork — capability policies, module caching,
-plugin distribution — are exactly the parts that should be tailored to
-your host.
+the parts you need to fork — capability policies, plugin distribution,
+log routing — are exactly the parts that should be tailored to your
+host.

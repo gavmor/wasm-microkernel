@@ -35,14 +35,12 @@ func loadPing(t *testing.T) []byte {
         return wasmBytes
 }
 
+// newEngine returns a fresh Engine. By default no outbound HTTP is
+// allowed; tests that need it set AllowedHosts on the returned value.
 func newEngine(t *testing.T) *host.Engine {
         t.Helper()
-        ctx := context.Background()
-        eng, err := host.NewEngine(ctx)
-        if err != nil {
-                t.Fatalf("new engine: %v", err)
-        }
-        t.Cleanup(func() { _ = eng.Close(ctx) })
+        eng := host.NewEngine()
+        t.Cleanup(func() { _ = eng.Close(context.Background()) })
         return eng
 }
 
@@ -81,17 +79,17 @@ func TestEngine_Execute_PluginError(t *testing.T) {
                 t.Fatal("expected an error from plugin, got none")
         }
 
-        const want = "plugin logic error: simulated plugin error"
-        if err.Error() != want {
-                t.Errorf("want %q, got %q", want, err.Error())
+        // Extism wraps the pdk.SetError message inside its own
+        // "guest call failed" envelope; assert on the inner text only.
+        const want = "simulated plugin error"
+        if !strings.Contains(err.Error(), want) {
+                t.Errorf("want error containing %q, got %q", want, err.Error())
         }
 }
 
-// TestEngine_Execute_EmptyRequest exercises the host's empty-request
-// fast path: when reqJSON == "", host.Execute skips the allocate/write
-// step entirely and calls execute(0, 0). The plugin's empty-string
-// branch confirms the guest's nil-pointer/zero-length input is handled
-// without panicking.
+// TestEngine_Execute_EmptyRequest passes an empty request through to the
+// plugin, confirming pdk.Input() returns an empty byte slice (not nil-
+// pointer panic) and the guest's empty-string branch fires cleanly.
 func TestEngine_Execute_EmptyRequest(t *testing.T) {
         wasmBytes := loadPing(t)
         eng := newEngine(t)
@@ -129,14 +127,16 @@ func TestEngine_Execute_LargePayload(t *testing.T) {
         }
 }
 
-// TestEngine_Execute_HttpPost validates the guest→host import path
-// (http_post) and the host→guest framed-response path end-to-end via an
-// httptest.Server. The plugin parses "POST <url> <body>" and calls
-// guest.HttpPost; the server echoes the request body back into a JSON
-// envelope which the plugin returns verbatim.
+// TestEngine_Execute_HttpPost validates that guest.HttpPost reaches an
+// allow-listed host through Extism's built-in HTTP capability. The plugin
+// parses "POST <url> <body>" and calls guest.HttpPost; the server echoes
+// the request body back into a JSON envelope which the plugin returns
+// verbatim. This also exercises Engine.AllowedHosts as the security gate.
 func TestEngine_Execute_HttpPost(t *testing.T) {
         wasmBytes := loadPing(t)
         eng := newEngine(t)
+        // httptest.Server binds 127.0.0.1 on a random port; allow that host.
+        eng.AllowedHosts = []string{"127.0.0.1"}
 
         var (
                 mu          sync.Mutex
@@ -186,6 +186,31 @@ func TestEngine_Execute_HttpPost(t *testing.T) {
         }
         if gotContentType != "application/json" {
                 t.Errorf("server saw content-type %q, want application/json", gotContentType)
+        }
+}
+
+// TestEngine_Execute_HttpPost_Denied proves that AllowedHosts is a real
+// security gate: when the target host is not allow-listed, Extism aborts
+// the plugin call and Execute surfaces it as an error. This is the SDK's
+// SSRF defense — losing it would silently expose every plugin's network
+// surface to the host's outbound connectivity.
+func TestEngine_Execute_HttpPost_Denied(t *testing.T) {
+        wasmBytes := loadPing(t)
+        eng := newEngine(t)
+        // Deliberately leave AllowedHosts empty (deny-all).
+
+        srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                _, _ = w.Write([]byte(`should-never-be-reached`))
+        }))
+        defer srv.Close()
+
+        ctx, cancel := callCtx(t)
+        defer cancel()
+
+        payload := "POST " + srv.URL + "/echo {}"
+        _, err := eng.Execute(ctx, wasmBytes, payload)
+        if err == nil {
+                t.Fatal("expected denied-host call to fail, got nil error")
         }
 }
 
