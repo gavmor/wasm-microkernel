@@ -85,7 +85,7 @@ math, no fat-pointer encoding, no manual `linear-memory.Read/Write`.
 ## Prerequisites
 
 - Go 1.26 or newer (the module declares `go 1.26.1`).
-- Plugins must be built for `wasip1` in reactor mode (see Step 4).
+- Plugins must be built for `wasip1` in reactor mode (see Step 2).
 
 ## Step 1: Write a Plugin
 
@@ -193,8 +193,11 @@ engine.AllowedHosts = []string{
 }
 ```
 
-Plugins that try to reach a non-allow-listed host receive an HTTP error
-through `guest.HttpPost`, which they can surface to the caller.
+Plugins that try to reach a non-allow-listed host cause Extism to abort
+the entire `Execute` call — the plugin does not receive a clean error
+from `guest.HttpPost`. The host sees this as a `"plugin error: …"`
+returned from `engine.Execute`. Make sure every URL a plugin may attempt
+is in the allow-list if you need the plugin to handle the failure itself.
 
 ## Concurrency and Lifecycle
 
