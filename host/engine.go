@@ -19,6 +19,7 @@ import (
 // calls. Use []string{"*"} to allow everything.
 type Engine struct {
         AllowedHosts []string
+	AllowedPaths map[string]string
 }
 
 // NewEngine returns a fresh Engine. Tweak AllowedHosts on the returned
@@ -46,6 +47,10 @@ func (e *Engine) Execute(ctx context.Context, wasmBytes []byte, reqJSON string) 
                         extism.WasmData{Data: wasmBytes},
                 },
                 AllowedHosts: allowed,
+			AllowedPaths: e.AllowedPaths,
+                Memory: &extism.ManifestMemory{
+                        MaxHttpResponseBytes: 1024 * 1024 * 1024, // 1GB
+                },
         }
 
         plugin, err := extism.NewPlugin(ctx, manifest, extism.PluginConfig{
