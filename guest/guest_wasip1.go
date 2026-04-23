@@ -49,3 +49,7 @@ func httpGet(url string) (string, error) {
 	return string(resp.Body()), nil
 }
 
+func getConfig(key string) (string, bool) {
+	return pdk.GetConfig(key)
+}
+

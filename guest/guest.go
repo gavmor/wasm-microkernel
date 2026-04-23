@@ -38,3 +38,10 @@ func HttpGet(url string) (string, error) {
 	return httpGet(url)
 }
 
+// Config returns the value for the given key from the host-provided configuration.
+// This is used for infrastructure settings (URLs, API keys, models) that should
+// not be part of the business-logic payload.
+func Config(key string) (string, bool) {
+	return getConfig(key)
+}
+
