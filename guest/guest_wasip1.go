@@ -39,3 +39,13 @@ func httpPost(url, bodyJSON string) (string, error) {
 	}
 	return string(resp.Body()), nil
 }
+
+func httpGet(url string) (string, error) {
+	req := pdk.NewHTTPRequest(pdk.MethodGet, url)
+	resp := req.Send()
+	if status := resp.Status(); status >= 400 {
+		return "", fmt.Errorf("http_get: HTTP %d", status)
+	}
+	return string(resp.Body()), nil
+}
+

@@ -31,3 +31,10 @@ func LogMsg(msg string) {
 func HttpPost(url, bodyJSON string) (string, error) {
 	return httpPost(url, bodyJSON)
 }
+
+// HttpGet asks the host to GET url and returns the response body as a string.
+// Like HttpPost, this is subject to the host's AllowedHosts security policy.
+func HttpGet(url string) (string, error) {
+	return httpGet(url)
+}
+
