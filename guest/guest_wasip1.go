@@ -7,8 +7,12 @@ import (
 	"github.com/extism/go-pdk"
 )
 
-//go:wasmexport execute
-func execute() int32 {
+// Execute is the body of the WASM "execute" export. Plugins must re-export
+// it from package main with //go:wasmexport so the Go toolchain generates a
+// WASI reactor (_initialize) rather than a command (_start). Without that,
+// the Go runtime exits after _start and subsequent extism calls to execute
+// hit runtime.notInitialized.
+func Execute() int32 {
 	if pluginHandler == nil {
 		pdk.SetError(fmt.Errorf("plugin handler not registered: call guest.Register from init()"))
 		return 1

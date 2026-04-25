@@ -6,6 +6,10 @@ import (
 	"fmt"
 )
 
+// Execute is a no-op stub for host-side compilation (unit tests).
+// The real implementation lives in guest_wasip1.go.
+func Execute() int32 { return 0 }
+
 func logMsg(msg string) {
 	// No-op on host
 }
