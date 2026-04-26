@@ -4,10 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 
 	extism "github.com/extism/go-sdk"
 )
+
+func init() {
+	// Extism's httpRequest host function uses http.DefaultClient, which honours
+	// HTTP_PROXY / HTTPS_PROXY environment variables. Plugins communicate with
+	// internal services (e.g. Ollama on a Docker host network) that must reach
+	// their destination directly. Override DefaultTransport to bypass any
+	// ambient proxy for all plugin HTTP traffic.
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		noProxy := t.Clone()
+		noProxy.Proxy = nil
+		http.DefaultTransport = noProxy
+	}
+}
 
 // Config defines the security policy and capabilities for the Kernel.
 type Config struct {
