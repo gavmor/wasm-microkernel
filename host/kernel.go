@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	extism "github.com/extism/go-sdk"
@@ -14,11 +17,23 @@ func init() {
 	// Extism's httpRequest host function uses http.DefaultClient, which honours
 	// HTTP_PROXY / HTTPS_PROXY environment variables. Plugins communicate with
 	// internal services (e.g. Ollama on a Docker host network) that must reach
-	// their destination directly. Override DefaultTransport to bypass any
-	// ambient proxy for all plugin HTTP traffic.
+	// their destination directly. Override DefaultTransport with a proxy
+	// function that bypasses the proxy for RFC-1918 / loopback addresses while
+	// still routing external traffic through the configured proxy.
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		noProxy := t.Clone()
-		noProxy.Proxy = nil
+		noProxy.Proxy = func(req *http.Request) (*url.URL, error) {
+			host := req.URL.Hostname()
+			if ip := net.ParseIP(host); ip != nil {
+				if ip.IsLoopback() || ip.IsPrivate() {
+					return nil, nil
+				}
+			}
+			if host == "localhost" || strings.HasSuffix(host, ".local") {
+				return nil, nil
+			}
+			return http.ProxyFromEnvironment(req)
+		}
 		http.DefaultTransport = noProxy
 	}
 }
